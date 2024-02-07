@@ -1,0 +1,132 @@
+
+LOAD
+	Lib
+INLINE [
+Lib
+DataFiles
+DataFiles
+];
+
+// Initialise link ID for QVDs
+let iID = 1000000;
+
+// Set some constants
+let vDateFormat = 'DD MMM YYYY';
+let vMonthFormat = 'MMM-YY';
+let vLoadTime = Date(now(), '$(vDateFormat) hh:mm:ss');
+
+// Set a function for getting date parts built
+set vDateParts = Date(DayStart([$1]), 'DD MMM YYYY') as [$2 Date],
+                    Date(Floor([$1],1/24), 'DD MMM YYYY hh:mm') as [$2 Date Hour],
+                    Date(MonthStart([$1]), 'MMM-YYYY') as [$2 Month],
+                    Year([$1]) as [$2 Year],
+                    Month([$1]) as [$2 Month Name],
+                    WeekDay([$1]) as [$2 Weekday],
+                    Hour([$1]) as [$2 Hour];
+
+// Loop through each of the libraries in the temporary table
+for iLib = 0 to NoOfRows('tmpLibs') - 1
+
+    let vLibName    = peek('Lib', iLib, 'tmpLibs');
+    let vLib        = 'lib://$(vLibName)/';
+    
+    // Loop for each QVD file in this library
+    for each vFile in FileList('$(vLib)*.qvd')
+        let iID = iID + 1;
+
+        // Load the stats from each QVD
+        let vFileDate = Date(FileTime('$(vFile)'), '$(vDateFormat) hh:mm:ss');
+        let vFileShortName = mid(vFile, index(vFile, '/', -1) + 1, 99);
+        let vQVDFields = QvdNoOfFields('$(vFile)');
+
+        let vQVDName = mid(vFileShortName, 1, len(vFileShortName) - 4);  // remove extension
+
+        let vFileAge = Date#('$(vLoadTime)', '$(vDateFormat) hh:mm:ss')- FileTime('$(vFile)');
+        let vFileSize = Alt(FileSize('$(vFile)'), 0);
+
+        set vDateCode = Date(Date#('$(vFileDate)', '$(vDateFormat) hh:mm:ss'), '$(vDateFormat) hh:mm:ss');
+
+        Temp_QVDHeader:
+        LOAD 
+            $(iID)                      as JoinID,
+            '$(vLibName)'               as Library,
+            QvBuildNo                   as QvBuildNo,
+            CreatorDoc                  as [File Created By],
+            TableName                   as [Table Name],
+            num(NoOfRecords, '#,##0')   as [Number Of Records]
+        FROM [$(vFile)] (XmlSimple, Table is [QvdTableHeader]);
+
+        QVDFileStructure:
+        LOAD
+            *,
+            $(vDateParts(File Date Time,File))
+            ;
+        LOAD
+            1											as FieldCount,
+            $(vDateCode) & ':' & 
+                Upper(purgechar('$(vLib)|$(vQVDName)', ' _/'))	as QVDKey,
+
+            $(iID)										as JoinID,
+
+            '$(vFileShortName)'							as [File Name],
+            '$(vFile)'									as [File Location],
+            $(vDateCode)								as [File Date Time],
+            num($(vFileSize), '#,##0')					as [File Size],
+
+            num($(vQVDFields), '#,##0')					as [Total Field Count],
+
+            '$(vQVDName)'								as [QVD Name],
+            FieldName									as [Field Name],
+            num(Length, '#,##0')						as [Field Length],
+            num(NoOfSymbols, '#,##0')					as [Unique Values],
+            if(NoOfSymbols = 0, 'Yes', 'No')			as [Only Null],
+            if(NoOfSymbols = 1, 'Yes', 'No')			as [Single Value],
+            Capitalize([NumberFormat/Type])				as [Field Type],
+
+            floor($(vFileAge)) & 'd ' &
+            	Date($(vFileAge) - floor($(vFileAge)),
+                							'hh:mm:ss') as [File Age],
+            num(floor($(vFileAge)), '#,##0')			as [File Age Days],
+            num(floor($(vFileAge) * 24), '#,##0')		as [File Age Hours],
+            num(floor($(vFileAge) * 24 * 60), '#,##0')	as [File Age Minutes]
+        FROM [$(vFile)] (XmlSimple, Table is [QvdTableHeader/Fields/QvdFieldHeader]);
+
+	next   // next file in libraary
+next  // next library
+
+DROP TABLE tmpLibs;
+
+let iLib=;
+let vLib=;
+
+// Prefer having a single table for all information for archive code
+LEFT JOIN (QVDFileStructure)
+LOAD 
+    JoinID,
+    Library,
+    QvBuildNo,
+    [File Created By],
+    [Table Name],
+    [Number Of Records]
+RESIDENT Temp_QVDHeader;
+
+DROP TABLE Temp_QVDHeader;
+
+DROP FIELD JoinID;
+
+let vNoOfRows = vNoOfRows + NoOfRows('QVDFileStructure');
+
+// Clean up after ourselves
+let iID             =;
+let vDateFormat     =;
+let vMonthFormat    =;
+let vDateParts      =;
+let vLibName        =;
+let vFile           =;
+let vFileDate       =;
+let vFileShortName  =;
+let vQVDFields      =;
+let vQVDName        =;
+let vFileAge        =;
+let vFileSize       =;
+set vDateCode       =;

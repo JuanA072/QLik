@@ -1,0 +1,603 @@
+let iBackstop = 100;
+
+// Flag to say whether we want to refresh all data
+let iLoadAll	= 0;
+
+// Name or alias of your Qlik Sense Cloud instance
+let vInstance	= 'tenant.region.qlikcloud.com';
+
+// The API key to use - generated under your Profile settings
+let vAPIKey 	= '****** Insert Your API Key Here ******';
+
+// Define where QVDs live
+let vQVD		= 'lib://DataFiles/$(vInstance)/';
+
+
+// Functions for various purposes
+set vDC = date(date#(left(purgechar([$1], 'TZ-:'), 14), 'YYYYMMDDhhmmss'), 'DD MMM YYYY hh:mm:ss');
+set vDF = date($1, 'DD MMM YYYY hh:mm:ss');
+
+
+// Connect to the REST connection
+LIB CONNECT TO 'GenericGET';
+
+// The initial URL to use for the space list
+let vURL = 'https://$(vInstance)/api/v1/spaces?limit=100&sort=-createdAt';
+
+let iPage = 0;
+do while len(vURL) > 0 and iPage < iBackstop
+	let iPage = iPage + 1;
+    
+    TRACE ***** Fetching Space Page $(iPage);
+    
+    JSON:
+    SQL SELECT 
+        "__KEY_root",
+        (SELECT 
+            "id",
+            "type",
+            "ownerId",
+            "tenantId",
+            "resourceId",
+            "name",
+            "description",
+            "createdAt",
+            "createdBy",
+            "updatedAt"
+        FROM "data" PK "__KEY_data" FK "__FK_data"),
+        (SELECT 
+            (SELECT 
+                "href"
+            FROM "next" FK "__FK_next")
+        FROM "links" PK "__KEY_links_u0" FK "__FK_links_u0")
+    FROM JSON (wrap on) "root" PK "__KEY_root"
+    WITH CONNECTION (  
+      URL "$(vURL)",
+     HTTPHEADER "Authorization" "Bearer $(vAPIKey)"  
+    );
+    
+    // Append raw data to temporary table
+    tmpSpace:
+    LOAD
+        id,
+        type,
+        name,
+        createdAt,
+        createdBy,
+        updatedAt,
+        tenantId,
+        resourceId,
+        ownerId,
+        description
+    RESIDENT JSON
+    WHERE NOT IsNull(id)
+    ;
+
+    tmpPage:
+    LOAD
+        href
+    RESIDENT JSON
+    WHERE NOT IsNull(href);
+    
+    DROP TABLE JSON;
+    
+    // Next page URL, will be blank if all data fetched
+    let vURL = peek('href', -1, 'tmpPage');
+    DROP TABLE tmpPage;
+loop
+
+// If QVD found append from that to get deleted spaces
+if alt(FileSize('$(vQVD)Audit_SpaceRaw.qvd'), 0) > 0 then
+	CONCATENATE (tmpSpace)
+    LOAD
+    	*
+	FROM [$(vQVD)Audit_SpaceRaw.qvd] (qvd)  
+    WHERE NOT EXISTS (id);
+end if
+
+// Write the new QVD
+STORE tmpSpace INTO [$(vQVD)Audit_SpaceRaw.qvd] (qvd);
+
+// Create mapping tables
+Map_SpaceName:
+MAPPING LOAD
+	id,
+    name
+RESIDENT tmpSpace;
+
+Map_SpaceType:
+MAPPING LOAD
+	id,
+    capitalize(type) as t
+RESIDENT tmpSpace;
+
+DROP TABLE tmpSpace;
+
+
+// The initial URL to use for the app list
+let vURL = 'https://$(vInstance)/api/v1/items?limit=100&sort=-createdAt';
+
+let iPage = 0;
+do while len(vURL) > 0 and iPage < iBackstop
+	let iPage = iPage + 1;
+    
+    TRACE ***** Fetching App Page $(iPage);
+    
+    JSON:
+    SQL SELECT 
+        "__KEY_root",
+        (SELECT 
+            "id",
+            "name",
+            "createdAt",
+            "updatedAt",
+            "resourceId",
+            "resourceType",
+            "creatorId",
+            "updaterId",
+            "tenantId",
+            "isFavorited",
+            "ownerId",
+            "description",
+            (SELECT
+            	"id" as "fkid",
+                "hasSectionAccess",
+                "lastReloadTime",
+                "publishTime",
+                "published",
+                "spaceId",
+                "thumbnail",
+                "encrypted",
+                "__FK_resourceAttributes"
+            FROM "resourceAttributes" FK "__FK_resourceAttributes")
+        FROM "data" PK "__KEY_data" FK "__FK_data"),
+        (SELECT 
+            (SELECT 
+                "href"
+            FROM "next" FK "__FK_next")
+        FROM "links" PK "__KEY_links_u0" FK "__FK_links_u0")
+    FROM JSON (wrap on) "root" PK "__KEY_root"
+    WITH CONNECTION (  
+      URL "$(vURL)",
+     HTTPHEADER "Authorization" "Bearer $(vAPIKey)"  
+    );
+    
+    // Append raw data to temporary table
+    tmpApps:
+    LOAD
+        id,
+        resourceId,
+        name,
+        createdAt,
+        updatedAt,
+        resourceType,
+        creatorId,
+        updaterId,
+        tenantId,
+        isFavorited,
+        ownerId,
+        description
+    RESIDENT JSON
+    WHERE NOT IsNull(id)
+    	AND (resourceType = 'app' or resourceType = 'qvapp')
+    ;
+
+	// Put attributes in their own temporary table
+    tmpAttribs:
+    LOAD
+    	fkid as resourceId,
+        spaceId,
+        hasSectionAccess,
+        lastReloadTime,
+        publishTime,
+        published,
+        thumbnail,
+        encrypted
+    RESIDENT JSON
+    WHERE NOT IsNull(__FK_resourceAttributes);
+    
+    tmpPage:
+    LOAD
+        href
+    RESIDENT JSON
+    WHERE NOT IsNull(href);
+    
+    DROP TABLE JSON;
+    
+    // Next page URL, will be blank if all data fetched
+    let vURL = peek('href', -1, 'tmpPage');
+    DROP TABLE tmpPage;
+loop
+
+
+// Join the attributes onto the apps - check what happens with apps in multiple spaces
+LEFT JOIN (tmpApps)
+LOAD
+    *
+RESIDENT tmpAttribs;
+
+DROP TABLE tmpAttribs;
+
+// If QVD found append from that to get deleted apps
+if alt(FileSize('$(vQVD)Audit_AppsRaw.qvd'), 0) > 0 then
+    CONCATENATE (tmpApps)
+    LOAD
+    	*
+	FROM [$(vQVD)Audit_AppsRaw.qvd] (qvd)  
+    WHERE NOT EXISTS (resourceId);
+end if
+
+// Write the new QVD
+STORE tmpApps INTO [$(vQVD)Audit_AppsRaw.qvd] (qvd);
+
+// Create mapping tables
+Map_AppName:
+MAPPING LOAD
+    resourceId,
+    name
+RESIDENT tmpApps;
+
+Map_AppDesc:
+MAPPING LOAD
+    resourceId,
+    description
+RESIDENT tmpApps;
+
+Map_AppSpace:
+MAPPING LOAD
+    resourceId,
+    ApplyMap('Map_SpaceName', spaceId, 'Personal') as space
+RESIDENT tmpApps;
+
+Map_AppSpaceType:
+MAPPING LOAD
+    resourceId,
+    ApplyMap('Map_SpaceType', spaceId, 'Uknown') as st
+RESIDENT tmpApps;
+
+DROP TABLE tmpApps;
+
+    
+// See if there is a QVD of audit records - find the latest date if so
+if alt(FileSize('$(vQVD)Audit_Consumption.qvd'), 0) > 0 and iLoadAll <> 1 then
+    TRACE Finding date of last stored consumption record;
+    
+    tmpLatest:
+    LOAD
+    	max([Event Time])	as Latest
+    FROM [$(vQVD)Audit_Consumption.qvd] (qvd);
+    
+    let vLatest	= alt(peek('Latest', -1, 'tmpLatest'), 0);
+    
+    DROP TABLE tmpLatest;
+else
+	let vLatest	= 0;
+end if
+
+// The initial URL to use for consumption
+let vURL = 'https://$(vInstance)/api/v1/licenses/consumption?limit=100&sort=-endTime';
+
+let iPage = 0;
+do while len(vURL) > 0 and iPage < iBackstop
+	let iPage = iPage + 1;
+    
+    TRACE ***** Fetching Usage Page $(iPage);
+    
+    JSON:
+    SQL SELECT 
+        "__KEY_root",
+        (SELECT 
+            "id",
+            "userId",
+            "sessionId",
+            "appId",
+            "endTime",
+            "duration",
+            "allotmentId",
+            "capacityUsed",
+            "minutesUsed",
+            "licenseUsage"
+        FROM "data" FK "__FK_data"),
+        (SELECT 
+            "__KEY_links",
+            "__FK_links",
+            (SELECT 
+                "href",
+                "__FK_next"
+            FROM "next" FK "__FK_next"),
+            (SELECT 
+                "href" AS "href_u0",
+                "__FK_prev"
+            FROM "prev" FK "__FK_prev")
+        FROM "links" PK "__KEY_links" FK "__FK_links")
+    FROM JSON (wrap on) "root" PK "__KEY_root"
+    WITH CONNECTION (  
+    URL "$(vURL)",
+         HTTPHEADER "Authorization" "Bearer $(vAPIKey)"
+      );
+
+    // Append raw data to temporary table
+    tmpData:
+    LOAD
+        id,
+        userId,
+        sessionId,
+        appId,
+        endTime,
+        duration,
+        allotmentId,
+        capacityUsed,
+        minutesUsed,
+        licenseUsage
+    RESIDENT JSON
+    WHERE NOT IsNull(id);
+
+    tmpPage:
+    LOAD
+        href
+    RESIDENT JSON
+    WHERE NOT IsNull(href);
+    
+    DROP TABLE JSON;
+    
+    // Next page URL, will be blank if all data fetched
+    let vURL = peek('href', -1, 'tmpPage');
+    DROP TABLE tmpPage;
+    
+    // If there is more data to load and we already have some check the date
+    if len(vURL) > 0 and vLatest > 0 then
+    	tmpOldestNew:
+        LOAD
+        	min($(vDC(endTime))) as OldestNew
+        RESIDENT tmpData;
+        
+        let vOldestNew = peek('OldestNew', -1, 'tmpOldestNew');
+        
+        DROP TABLE tmpOldestNew;
+        
+        let vURL = if(vOldestNew < vLatest, null(), vURL);
+    end if
+loop
+
+Sessions:
+LOAD
+    *,
+    subfield(Tenant, '.', 1)                        as [Tenant Prefix],
+    Date(DayStart([Event Time]), 'DD MMM YYYY')     as Date,
+    Date(MonthStart([Event Time]), 'MMM-YYYY')      as Month,
+    Date(WeekStart([Event Time]), 'DD MMM YYYY')    as [Week Commencing],
+    Month([Event Time])                             as [Month Name],
+    Year([Event Time])                              as Year,
+    Hour([Event Time])                              as Hour,
+    WeekDay([Event Time])                           as Day
+    ;
+LOAD
+    1                                               as SessionCount,
+    id                                              as ConsumptionID,
+    sessionId                                       as SessionID,
+    appId                                           as AppID,
+    ApplyMap('Map_AppName', appId, 'Not Known')     as Application,
+    ApplyMap('Map_AppSpace', appId, 'Personal')     as Space,
+    ApplyMap('Map_AppSpaceType', appId, 'Personal') as [Space Type],
+    duration                                        as [Duration MS],
+    round(duration/60000)                           as [Duration Minutes],
+    Replace(timestamp(endTime-interval(round(duration/1000)/(60*60*24),'hh:mm:ss') ,'YYYY-MM-DD hh:mm:ssZ'),' ','T')  As [Event Time],
+    allotmentId                                     as AllotmentID,
+    capacityUsed                                    as [Capacity Used],
+    minutesUsed                                     as [Minutes Used],
+    Capitalize(replace(licenseUsage, '_', ' '))     as [Licence Used],
+    $(vDC(endTime))                 	            as [End Time],
+    '$(vInstance)'                                  as Tenant,
+    userId                                          as UserID,
+    $(vDF(now()))                                   as [Row Fetched]
+RESIDENT tmpData;
+
+DROP TABLE tmpData;
+    
+// If there is already a QVD append from it
+if alt(FileSize('$(vQVD)Audit_Consumption.qvd'), 0) > 0 then
+    CONCATENATE(Sessions)
+    LOAD
+    	*
+    FROM [$(vQVD)Audit_Consumption.qvd] (qvd)
+    WHERE NOT EXISTS (ConsumptionID)
+    ;
+end if
+
+// Write the new QVD
+STORE Sessions INTO [$(vQVD)Audit_Consumption.qvd] (qvd);
+
+
+// Load user details
+let vURL = 'https://$(vInstance)/api/v1/users?limit=100' ; //&status=invited%2Cactive%2Cdisabled%2Cdeleted';
+let iPage = 0;
+
+do while len(vURL) > 0 and iPage < iBackstop
+    let iPage = iPage + 1;
+    
+    TRACE ***** Fetching User Page $(iPage);
+    
+    JSON:
+    SQL SELECT 
+        (SELECT 
+            (SELECT 
+                "href"
+            FROM "next" FK "__FK_next")
+        FROM "links" PK "__KEY_links" FK "__FK_links"),
+        (SELECT 
+            "id",
+            "created",
+            "lastUpdated",
+            "status",
+            "name",
+            "subject",
+            "picture",
+            "email"
+        FROM "data" PK "__KEY_data" FK "__FK_data")
+    FROM JSON (wrap on) "root" PK "__KEY_root"
+    WITH CONNECTION (
+      URL "$(vURL)",
+      HTTPHEADER "Authorization" "Bearer $(vAPIKey)"  
+    )
+    ;
+
+    // Append raw data to temporary table
+    tmpUsers:
+    LOAD
+        id,
+        created,
+        lastUpdated,
+        status,
+        name,
+        subject,
+        picture,
+        email
+    RESIDENT JSON
+    WHERE NOT IsNull(id);
+
+    tmpPage:
+    LOAD
+        href
+    RESIDENT JSON
+    WHERE NOT IsNull(href);
+    
+    DROP TABLE JSON;
+    
+    // Next page URL, will be blank if all data fetched
+    let vURL = peek('href', -1, 'tmpPage');
+    DROP TABLE tmpPage;
+loop
+
+Users:
+LOAD
+    *,
+    [User Name] & ' (' & Organisation & ')'     as [Name and Organisation]
+    ;
+LOAD
+    *,
+    subfield([User Email], '@', 2)              as Domain,
+    textbetween([User Email], '@', '.')         as Organisation
+    ;
+LOAD
+    1                                           as UserCount,
+    id                                          as UserID,
+    id                                          as tmpUserID,
+    $(vDC(created))                             as [User Created],
+    capitalize(status)                          as [User Status],
+    $(vDC(lastUpdated))                         as [User Last Updated],
+    if(isnull(name), 'Not Known',
+                           capitalize(name))    as [User Name], 
+    if(isnull(name), 'user@notknown.com',
+                         lower(email))          as [User Email],
+    picture                                     as [Picture Link],
+    subject                                     as Subject,
+    id                                          as UserExists
+RESIDENT tmpUsers;
+
+DROP TABLE tmpUsers;
+
+// If there is already a Users QVD append from it
+if alt(FileSize('$(vQVD)Audit_UserDetails.qvd'), 0) > 0 then
+    CONCATENATE(Users)
+    LOAD
+    	*
+    FROM [$(vQVD)Audit_UserDetails.qvd] (qvd)
+    WHERE NOT EXISTS (tmpUserID, UserID)
+    ;
+end if
+
+DROP FIELD tmpUserID;
+
+// Write the new QVD
+STORE Users INTO [$(vQVD)Audit_UserDetails.qvd] (qvd);
+
+
+// Fetch the licences and attach these to the users we have
+let vURL = 'https://$(vInstance)/api/v1/licenses/assignments?limit=100';
+let iPage = 0;
+
+do while len(vURL) > 0 and iPage < iBackstop
+    let iPage = iPage + 1;
+    
+    TRACE ***** Fetching Licence Allocation Page $(iPage);
+    
+    JSON:
+    SQL SELECT
+        (SELECT 
+            "type",
+            "subject",
+            "created",
+            "excess"
+        FROM "data" FK "__FK_data"),
+        (SELECT
+            (SELECT 
+                "href"
+            FROM "next" FK "__FK_next")
+        FROM "links" PK "__KEY_links" FK "__FK_links")
+    FROM JSON (wrap on) "root" PK "__KEY_root"
+    WITH CONNECTION (
+      URL "$(vURL)",
+      HTTPHEADER "Authorization" "Bearer $(vAPIKey)"  
+    )
+    ;
+
+    Licences:
+    LOAD
+    	1                     as LicenceCount,
+        subject               as Subject,
+        capitalize(type)      as Licence,
+        $(vDC(created))       as [Licence Allocated],
+        excess                as Excess
+    RESIDENT JSON
+    WHERE NOT IsNull(subject);
+
+    tmpPage:
+    LOAD	
+        href
+    RESIDENT JSON
+    WHERE NOT IsNull(href);
+
+    DROP TABLE JSON;
+    
+    // Next page URL, will be blank if all data fetched
+    let vURL = peek('href', -1, 'tmpPage');
+    DROP TABLE tmpPage;
+loop
+
+// Store the Licence table
+STORE Licences INTO [$(vQVD)Audit_Licences.qvd] (qvd);
+
+// Create a mapping table of licence allocations
+Map_LicenceType:
+MAPPING LOAD
+    upper(Subject) as subj,
+    Licence
+RESIDENT Licences;
+
+DROP TABLE Licences;
+
+// Load the licence type for all users we know of
+UserLicences:
+LOAD DISTINCT
+    UserID,
+    ApplyMap('Map_LicenceType', upper(Subject), if([User Status] = 'Invited', 'Invited', 'None')) as Licence
+RESIDENT Users;
+
+
+// Remove fields not needed in the front end - but kept in QVDs anyways
+//DROP FIELDS ;
+
+// Clean up after ourselves
+let vInstance   =;
+let vAPIKey     =;
+let iBackstop   =;
+let vInstance   =;
+let vAPIKey     =;
+let vQVD        =;
+let vURL        =;
+let vDC         =;
+let vDF         =;
+let iPage       =;
+let vLatest     =;
+let vOldestNew  =;
+let iLoadAll    =;

@@ -1,0 +1,268 @@
+
+// Set variables which identify this server and form part of the log names
+// Check in the ServerLogFolder and ArchivedLogsFolder to find the values for your installation
+let vServerName        = ComputerName();
+let vFullServerName    = 'servername.domain.local';  // Usually FQDN
+
+// Build out file paths and file masks based on the variables above
+let vCurLog            = 'lib://ServerLogFolder/';
+let vLogFolder         = 'lib://ArchivedLogsFolder/$(vFullServerName)/';
+let vCurFile           = '$(vCurLog)Engine/Trace/$(vServerName)_Session_Engine.txt';
+let vArchiveFiles      = '$(vLogFolder)Engine/Trace/$(vServerName)_Session_Engine_*.log';
+
+// Create parameterised variables for repeated tasks
+set vDT = Date(Date#(left(replace($1, 'T', ' '), 15), 'YYYYMMDD hhmmss'), 'DD MMM YYYY hh:mm:ss');
+
+// Loop for the types of licences that we have
+tmpLicType:
+LOAD
+    LicType
+INLINE [
+LicType
+analyzer
+professional
+];
+
+// Loop for each type of licence
+for iLT = 0 to NoOfRows('tmpLicType') -1
+
+    let vLicType = peek('LicType', iLT, 'tmpLicType');
+    
+    // Connect to the correct connector and get users
+    LIB CONNECT TO 'monitor_apps_REST_license_$(vLicType)';
+
+    // Pull details from the API - note we are pulling more fields than we are going to use
+    tmpLicences:
+    SQL SELECT 
+        "id" AS "id_u0",
+        "createdDate",
+        "modifiedDate",
+        "modifiedByUserName",
+        "lastUsed",
+        "quarantined",
+        "quarantineEnd",
+        "deletedUserId",
+        "deletedUserDirectory",
+        "privileges" AS "privileges_u0",
+        "impactSecurityAccess",
+        "schemaPath",
+        "__KEY_root",
+        (SELECT 
+            "id",
+            "userId",
+            "userDirectory",
+            "name",
+            "privileges",
+            "__FK_user"
+        FROM "user" FK "__FK_user")
+    FROM JSON (wrap on) "root" PK "__KEY_root";
+
+    // Lookup names and format
+    Map_User$(iLT):
+    MAPPING LOAD
+        "__FK_user",
+        name
+    RESIDENT tmpLicences
+    WHERE NOT IsNull([__FK_user]);
+    
+    Map_UserID$(iLT):
+    MAPPING LOAD
+        "__FK_user",
+        userId
+    RESIDENT tmpLicences
+    WHERE NOT IsNull([__FK_user]);
+
+    tmpCALUsage:
+    LOAD
+        ApplyMap('Map_UserID$(iLT)', [__KEY_root], 'Missing') as UserID,
+        ApplyMap('Map_User$(iLT)', [__KEY_root], 'Missing') as UserName,
+    	Capitalize('$(vLicType)')	as LicenceType,
+        Date(Date#(left(Replace(lastUsed, 'T', ''), 18), 'YYYY-MM-DDhh:mm:ss'), 'DD MMM YYYY hh:mm:ss') as LastUsed,
+        Date(Date#(left(Replace(quarantineEnd, 'T', ''), 18), 'YYYY-MM-DDhh:mm:ss'), 'DD MMM YYYY hh:mm:ss') as QuarantinedUntil
+    RESIDENT tmpLicences
+    WHERE NOT IsNull([__KEY_root]);
+
+    DROP TABLE tmpLicences;
+next
+
+DROP TABLE tmpLicType;
+
+// Concatenate old users - in case any go missing from AD
+if Alt(FileSize('$(vQVDs)SessionLogUsers.qvd'), 0) > 0 then
+    CONCATENATE(tmpCALUsage)
+    LOAD
+        UserID,
+        UserName,
+        'None' as LicenceType,
+        LastUsed,
+        null() as QuarantinedUntil
+    FROM [$(vQVDs)SessionLogUsers.qvd] (qvd)
+    WHERE NOT EXISTS (UserID)
+    ;
+end if
+
+// Persist user table
+STORE tmpCALUsage INTO [$(vQVDs)SessionLogUsers.qvd] (qvd);
+    
+// Create mapping tables from the licence information
+
+// Note that only usernames for users who hold a licence will pull through
+// If you have Capacity licences then you may want to query the Directory Service API to get these
+Map_UserName:
+MAPPING LOAD
+    upper(UserID) as ui,
+    UserName
+RESIDENT tmpCALUsage;
+
+Map_LicenceType:
+MAPPING LOAD
+    upper(UserID) as ui,
+    LicenceType
+RESIDENT tmpCALUsage;
+
+Map_Quarantined:
+MAPPING LOAD
+    upper(UserID) as ui,
+    if(alt(QuarantinedUntil, 0) < 42000, 'No', 'Yes') as q
+RESIDENT tmpCALUsage;
+
+DROP TABLE tmpCALUsage;
+
+// Load the raw data from the current file
+if alt(FileSize('$(vCurFile)'), 0) > 0 then
+    Temp_Sessions:
+    LOAD
+        ActiveUserId,
+        [App Title],
+        [Session Start],
+        [Exit Reason],
+        Level,
+        Hostname,
+        ServiceUser,
+        ActiveUserDirectory,
+        Timestamp,
+        [Exe Version],
+        [Server Started],
+        AppId,
+        [Doc Timestamp],
+        [Authenticated User],
+        [Secure Protocol],
+        [Session Duration],
+        [CPU Spent (s)],
+        [Bytes Received],
+        [Bytes Sent],
+        Calls,
+        Selections
+    FROM [$(vCurFile)]
+    (txt, utf8, embedded labels, delimiter is '\t', msq)
+    // Ignoring reload sessions. Remove next line if you want all sessions
+    WHERE ActiveUserId <> 'sa_scheduler' and ActiveUserId <> 'sa_repository'
+    ;
+end if
+
+// Concatenate onto the temporary table the raw data from all of the archive files
+// Strongly suggest building an archive of QVD files for historical logs and
+// concatenate these at the end of the process - this is not done in this example though
+for each vFile in FileList('$(vArchiveFiles)')
+    Temp_Sessions:
+    LOAD
+        ActiveUserId,
+        [App Title],
+        [Session Start],
+        [Exit Reason],
+        Level,
+        Hostname,
+        ServiceUser,
+        ActiveUserDirectory,
+        Timestamp,
+        [Exe Version],
+        [Server Started],
+        AppId,
+        [Doc Timestamp],
+        [Authenticated User],
+        [Secure Protocol],
+        [Session Duration],
+        [CPU Spent (s)],
+        [Bytes Received],
+        [Bytes Sent],
+        Calls,
+        Selections
+    FROM [$(vFile)]
+    (txt, utf8, embedded labels, delimiter is '\t', msq)
+    // Ignoring reload sessions. Remove next line if you want all sessions
+    WHERE ActiveUserId <> 'sa_scheduler' and ActiveUserId <> 'sa_repository'
+    ;
+next
+
+// Format all raw values, calculate new values and rename fields
+Sessions:
+LOAD
+    1                                                      as SessionCount,
+    *,
+    Date(DayStart([Session Start]), 'DD MMM YYYY')         as Date,
+    Date(MonthStart([Session Start]), 'MMM YYYY')          as Month,
+    Date(WeekStart([Session Start]), 'DD MMM YYYY')        as [Week Commencing],
+    Year([Session Start])                                  as Year,
+    Month([Session Start])                                 as [Month Name],
+    Hour([Session Start])                                  as Hour,
+    WeekDay([Session Start])                               as Day,
+    Time(Round(
+        [Session Start] - DayStart([Session Start]),
+                                      (1/288)), 'hh:mm')   as Time,  // nearest 5min
+    Floor([Session Start] - [Server Started])              as [Days Since Server Start],
+    Floor(([Session End] - [Document Reloaded]) * 24)      as [Hours Since Document Reload],
+    Round([Bytes Received] * 1024, 1)                      as [KB Received],
+    Round([Bytes Sent] * 1024, 1)                          as [KB Sent] 
+    ;
+LOAD
+    ActiveUserId                        as User,
+    ApplyMap('Map_UserName', upper(ActiveUserId), 'Not Known: ' & ActiveUserId) as [User Name],
+    ApplyMap('Map_LicenceType', upper(ActiveUserId), 'None') as [Licence Held],
+    [App Title]                         as Application,
+    $(vDT([Session Start]))             as [Session Start],
+    [Exit Reason],
+    Level,
+    Hostname,
+    ServiceUser                         as [Service User],
+    ActiveUserDirectory                 as [User Directory],
+    $(vDT(Timestamp))                   as [Session End],
+    [Exe Version]                       as [Server Version],
+    $(vDT([Server Started]))            as [Server Started],
+    AppId,
+    $(vDT([Doc Timestamp]))             as [Document Reloaded],
+    [Authenticated User],
+    [Secure Protocol],
+    rangemin([Session Duration], 0.5)   as [Session Duration],  // clip as error can cause incorrect duration
+    [CPU Spent (s)],
+    [Bytes Received],
+    [Bytes Sent],
+    Calls,
+    Selections,
+    ApplyMap('Map_Quarantined', upper(ActiveUserId), 'No') as Quarantined
+RESIDENT Temp_Sessions
+;
+
+// Drop the temporary table
+DROP TABLE Temp_Sessions;
+
+// Left join a table which has the office locations of each user to enable the map sheet
+// If you don't have that information simply delete the map sheet from the app
+LEFT JOIN (Sessions)
+LOAD
+    // User,
+    Office as [Office Location],
+    GeoMakePoint(Latitude,Longitude) as [Office Location Point]
+INLINE [
+User,Office,Latitude,Longitude
+All Users,Head Office,51.415981,-0.752290
+];
+
+// Clean up all the variables we have used
+let vServerName        = ;
+let vFullServerName    = ;
+let vCurLog            = ;
+let vLogFolder         = ;
+let vCurFile           = ;
+let vArchiveFiles      = ;
+let vCurFile           = ;
+let vFile              = ;
